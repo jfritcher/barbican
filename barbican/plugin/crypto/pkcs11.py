@@ -26,6 +26,8 @@ Attribute = collections.namedtuple("Attribute", ["type", "value"])
 CKAttributes = collections.namedtuple("CKAttributes", ["template", "cffivals"])
 CKMechanism = collections.namedtuple("CKMechanism", ["mech", "cffivals"])
 
+NoneType = type(None)
+
 CKR_OK = 0
 CKF_RW_SESSION = (1 << 1)
 CKF_SERIAL_SESSION = (1 << 2)
@@ -37,7 +39,11 @@ CKS_RO_USER_FUNCTIONS = 1
 CKS_RW_PUBLIC_SESSION = 2
 CKS_RW_USER_FUNCTIONS = 3
 
+CKO_PUBLIC_KEY = 2
+CKO_PRIVATE_KEY = 3
 CKO_SECRET_KEY = 4
+
+CKK_RSA = 0x0
 CKK_AES = 0x1f
 
 CKA_CLASS = 0
@@ -122,6 +128,7 @@ CKA_REQUIRED_CMS_ATTRIBUTES = 0x501
 CKA_DEFAULT_CMS_ATTRIBUTES = 0x502
 CKA_SUPPORTED_CMS_ATTRIBUTES = 0x503
 
+CKM_RSA_PKCS_KEY_PAIR_GEN = 0x0
 CKM_SHA256_HMAC = 0x251
 CKM_AES_KEY_GEN = 0x1080
 CKM_AES_CBC = 0x1082
@@ -285,6 +292,8 @@ def build_ffi():
     CK_RV C_GetSessionInfo(CK_SESSION_HANDLE, CK_SESSION_INFO_PTR);
     CK_RV C_Login(CK_SESSION_HANDLE, CK_USER_TYPE, CK_UTF8CHAR_PTR,
                   CK_ULONG);
+    CK_RV C_GetAttributeValue(CK_SESSION_HANDLE, CK_OBJECT_HANDLE,
+                              CK_ATTRIBUTE *, CK_ULONG);
     CK_RV C_SetAttributeValue(CK_SESSION_HANDLE, CK_OBJECT_HANDLE,
                               CK_ATTRIBUTE *, CK_ULONG);
     CK_RV C_DestroyObject(CK_SESSION_HANDLE, CK_OBJECT_HANDLE);
@@ -294,6 +303,9 @@ def build_ffi():
     CK_RV C_FindObjectsFinal(CK_SESSION_HANDLE);
     CK_RV C_GenerateKey(CK_SESSION_HANDLE, CK_MECHANISM *, CK_ATTRIBUTE *,
                         CK_ULONG, CK_OBJECT_HANDLE *);
+    CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE, CK_MECHANISM *, CK_ATTRIBUTE *,
+                            CK_ULONG, CK_ATTRIBUTE *, CK_ULONG,
+                            CK_OBJECT_HANDLE *, CK_OBJECT_HANDLE *);
     CK_RV C_UnwrapKey(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE,
                       CK_BYTE *, CK_ULONG, CK_ATTRIBUTE *, CK_ULONG,
                       CK_OBJECT_HANDLE *);
@@ -350,6 +362,8 @@ class PKCS11(object):
         self.blocksize = 16
         self.noncesize = 12
         self.gcmtagsize = 16
+
+        self.asymmetric_public_exponent = '\x01\x00\x01'  # 65537
 
         # Validate configuration and RNG
         session = self.get_session()
@@ -483,6 +497,44 @@ class PKCS11(object):
 
         return obj_handle_ptr[0]
 
+    def generate_keypair(self, key_length, session, sensitive=True,
+                         encrypt=False, sign=False, wrap=False):
+        # If key is sensitive, then at least one usage flag must be specified
+        if sensitive and not encrypt and not sign and not wrap:
+            raise P11CryptoPluginException()
+
+        pub_ck_attributes = self._build_attributes([
+            Attribute(CKA_TOKEN, False),
+            Attribute(CKA_PRIVATE, True),
+            Attribute(CKA_ENCRYPT, encrypt),
+            Attribute(CKA_VERIFY, sign),
+            Attribute(CKA_WRAP, wrap),
+            Attribute(CKA_MODULUS_BITS, key_length),
+            Attribute(CKA_PUBLIC_EXPONENT, self.asymmetric_public_exponent)
+        ])
+        priv_ck_attributes = self._build_attributes([
+            Attribute(CKA_TOKEN, False),
+            Attribute(CKA_PRIVATE, True),
+            Attribute(CKA_EXTRACTABLE, True),
+            #Attribute(CKA_SENSITIVE, sensitive)
+            Attribute(CKA_DECRYPT, encrypt),
+            Attribute(CKA_SIGN, sign),
+            Attribute(CKA_UNWRAP, wrap)
+        ])
+        mech = self.ffi.new("CK_MECHANISM *")
+        mech.mechanism = CKM_RSA_PKCS_KEY_PAIR_GEN
+        pub_key_handle = self.ffi.new("CK_OBJECT_HANDLE *")
+        priv_key_handle = self.ffi.new("CK_OBJECT_HANDLE *")
+        rv = self.lib.C_GenerateKeyPair(session, mech,
+                                        pub_ck_attributes.template,
+                                        len(pub_ck_attributes.template),
+                                        priv_ck_attributes.template,
+                                        len(priv_ck_attributes.template),
+                                        pub_key_handle, priv_key_handle)
+        self._check_error(rv)
+
+        return (pub_key_handle[0], priv_key_handle[0])
+
     def wrap_key(self, wrapping_key, key_to_wrap, session):
         mech = self.ffi.new("CK_MECHANISM *")
         mech.mechanism = CKM_AES_CBC_PAD
@@ -587,7 +639,7 @@ class PKCS11(object):
         for index, attr in enumerate(attrs):
             attributes[index].type = attr.type
             if isinstance(attr.value, bool):
-                val_list.append(self.ffi.new("unsigned char *",
+                val_list.append(self.ffi.new("CK_BYTE *",
                                 int(attr.value)))
                 attributes[index].value_len = 1  # sizeof(char) is 1
             elif isinstance(attr.value, int):
@@ -596,11 +648,14 @@ class PKCS11(object):
                 attributes[index].value_len = 8
             elif isinstance(attr.value, str):
                 buf = attr.value.encode('utf-8')
-                val_list.append(self.ffi.new("char []", buf))
+                val_list.append(self.ffi.new("CK_BYTE []", buf))
                 attributes[index].value_len = len(buf)
             elif isinstance(attr.value, bytes):
-                val_list.append(self.ffi.new("char []", attr.value))
+                val_list.append(self.ffi.new("CK_BYTE []", attr.value))
                 attributes[index].value_len = len(attr.value)
+            elif isinstance(attr.value, NoneType):
+                val_list.append(self.ffi.NULL)
+                attributes[index].value_len = 0
             else:
                 raise TypeError(u._("Unknown attribute type provided."))
 
